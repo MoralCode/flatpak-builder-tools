@@ -4,199 +4,316 @@ import argparse
 from pathlib import Path
 from collections import deque, defaultdict
 
-def extract_cmake_variable(content, var_name):
-    """Extracts a CMake variable value (simple case)."""
-    match = re.search(rf'{var_name}\s*=\s*([^\n\r]+)', content)
+# --- Helper Functions ---
+
+def _extract_from_regex(content, regex, default_value=None):
+    """Generic helper to extract a single match from content using a regex."""
+    match = re.search(regex, content, re.DOTALL)
     if match:
         return match.group(1).strip().strip('"').strip("'")
-    return None
+    return default_value
 
-def parse_vcpkg_portfile(portfile_path: Path, vcpkg_root: Path) -> tuple[dict, list, list]:
+def _extract_all_from_regex(content, regex):
+    """Generic helper to extract all non-overlapping matches from content using a regex."""
+    return re.findall(regex, content, re.DOTALL)
+
+def _clean_cmake_option(opt: str, package_version: str) -> str | None:
+    """Cleans and translates a single CMake option string."""
+    opt = opt.strip().strip('"').strip("'")
+    if not opt or opt.startswith("#"):
+        return None
+
+    # Vcpkg feature variable placeholder
+    if "${FEATURE_OPTIONS}" in opt or re.match(r'\$\{\w+_FEATURE_OPTIONS\}', opt):
+        return None
+
+    # Replace vcpkg-specific paths with Flatpak-native /app/vendor
+    opt = opt.replace('${CURRENT_HOST_INSTALLED_DIR}/tools/protobuf/protoc${VCPKG_HOST_EXECUTABLE_SUFFIX}', '/app/vendor/bin/protoc')
+    opt = opt.replace('${CURRENT_INSTALLED_DIR}', '/app/vendor')
+    opt = opt.replace('${CURRENT_HOST_INSTALLED_DIR}', '/app/vendor')
+    opt = opt.replace('${CURRENT_PACKAGES_DIR}', '/app/vendor')
+    # Replace vcpkg's internal VERSION variable with the actual discovered version
+    opt = opt.replace('${VERSION}', package_version)
+
+    # Remove vcpkg-specific build flags that Flatpak builder handles or are irrelevant
+    if (opt.startswith("-DCMAKE_TOOLCHAIN_FILE") or
+        opt.startswith("-DVCPKG_TARGET_TRIPLET") or
+        opt.startswith("-DVCPKG_SET_CHARSET_FLAG") or
+        opt.startswith("-DDLL_OUT_DIR") or
+        opt.startswith("-DARCHIVE_OUT_DIR") or
+        opt.startswith("-DCMAKE_DEBUG_POSTFIX") or
+        opt.startswith("-D_VCPKG_NO_DEFAULT_PATH_W") or
+        opt.startswith("-D_VCPKG_FIND_ROOT_PATH_") or
+        opt.startswith("-DCMAKE_MFC_FLAG") or
+        "VCPKG_CRT_LINKAGE" in opt or
+        "VCPKG_LIBRARY_LINKAGE" in opt
+    ):
+        return None
+
+    # Convert vcpkg's INSTALL_DIRS to just relying on CMAKE_INSTALL_PREFIX
+    if (opt.startswith("-DgRPC_INSTALL_BINDIR") or
+        opt.startswith("-DgRPC_INSTALL_LIBDIR") or
+        opt.startswith("-DgRPC_INSTALL_INCLUDEDIR") or
+        opt.startswith("-DgRPC_INSTALL_CMAKEDIR")):
+        return None
+
+    return opt
+
+# --- Source Acquisition Parsers ---
+
+def _parse_vcpkg_download_distfile(content: str, package_name: str, package_version: str) -> tuple[list, list] | None:
+    """Parses vcpkg_download_distfile and vcpkg_extract_source_archive calls."""
+    download_distfile_match = re.search(
+        r'vcpkg_download_distfile\(\s*'
+        r'ARCHIVE\s+([^\s\)]+)\s*'
+        r'(?:URLS\s+("(?P<urls_quoted>.*?)"|(?P<urls_raw>\S+))\s*)?'
+        r'(?:FILENAME\s+("(?P<filename_quoted>.*?)"|(?P<filename_raw>\S+))\s*)?'
+        r'(?:SHA512\s+(?P<sha512>\S+)\s*)?',
+        content,
+        re.DOTALL
+    )
+
+    if not download_distfile_match:
+        return None
+
+    sources = []
+    archive_name_var = download_distfile_match.group(1) # e.g., ARCHIVE
+    urls_str = download_distfile_match.group('urls_quoted') or download_distfile_match.group('urls_raw')
+    sha512 = download_distfile_match.group('sha512')
+
+    if urls_str:
+        urls_str = urls_str.replace('${VERSION}', package_version)
+        urls = re.findall(r'https?://[^\s,"]+', urls_str)
+        
+        source_entry = {
+            "type": "archive",
+            "url": urls[0] if urls else "",
+            "sha512": sha512.lower() if sha512 else "UNKNOWN_SHA512",
+            "x-checker-data": {} # Will be populated more precisely below
+        }
+
+        # Auto-generate x-checker-data for archives
+        if urls and "github.com" in urls[0]:
+            repo_match = re.match(r'https://github.com/([^/]+/[^/]+)/releases/download', urls[0])
+            if repo_match:
+                source_entry["x-checker-data"] = {
+                    "type": "github",
+                    "url": repo_match.group(1),
+                    "tag-pattern": r'^v?(\d+(?:\.\d+){1,2})$' # Common tag pattern
+                }
+        elif urls: # Fallback for non-github archives
+            source_entry["x-checker-data"] = {
+                "type": "html",
+                "url": urls[0].rsplit('/', 1)[0], # Get base path for updates
+                "version-pattern": r'(\d+(?:\.\d+){1,2})',
+                "url-pattern": re.escape(urls[0]).replace(re.escape(package_version), r'(\d+(?:\.\d+){1,2})') # Generic pattern for URL
+            }
+
+
+        # Check for NO_REMOVE_ONE_LEVEL from vcpkg_extract_source_archive
+        extract_archive_match = re.search(
+            r'vcpkg_extract_source_archive\(\s*'
+            r'(?:SOURCE_PATH\s+\S+\s*)?'
+            rf'ARCHIVE\s+"?\$?\{{{archive_name_var}\}}?"?\s*'
+            r'(?P<no_remove_one_level>NO_REMOVE_ONE_LEVEL)?',
+            content,
+            re.DOTALL
+        )
+        if extract_archive_match and extract_archive_match.group('no_remove_one_level'):
+            source_entry["extract-strip"] = 0
+        else:
+            source_entry["extract-strip"] = 1 # Default to 1 for standard archives
+
+        sources.append(source_entry)
+
+    # Extract patches from vcpkg_extract_source_archive call
+    patches_extract_match = re.search(
+        r'vcpkg_extract_source_archive\([\s\S]*?ARCHIVE\s+"?\$?\{{.*?\s*}(?:[\s\S]*?PATCHES\s*([\s\S]*?)(?=\)|\n\S))?',
+        content,
+        re.DOTALL
+    )
+    patches = []
+    if patches_extract_match and patches_extract_match.group(1):
+        patch_list_str = patches_extract_match.group(1)
+        patches.extend(re.findall(r'(\S+\.patch)', patch_list_str))
+    
+    return sources, patches
+
+def _parse_vcpkg_from_github(content: str, package_name: str, package_version: str) -> tuple[list, list] | None:
+    """Parses vcpkg_from_github calls."""
+    from_github_match = re.search(
+        r'vcpkg_from_github\(\s*'
+        r'(?:OUT_SOURCE_PATH\s+\S+\s*)?'
+        r'REPO\s+([^\s\)]+)\s*'
+        r'REF\s+"?\$?\{?VERSION\}?"?\s*(?:#.*)?\s*',
+        content,
+        re.DOTALL
+    )
+
+    if not from_github_match:
+        return None
+
+    sources = []
+    repo = from_github_match.group(1)
+    
+    source_tag = package_version # Use discovered version for tag
+
+    source_entry = {
+        "type": "git",
+        "url": f"https://github.com/{repo}.git",
+        "tag": source_tag.lstrip('vV') if source_tag.startswith('v') or source_tag.startswith('V') else source_tag,
+        "x-checker-data": {
+            "type": "git",
+            "url": f"https://github.com/{repo}.git",
+            "tag-pattern": r'^v?(\d+(?:\.\d+){1,2})$' # Common tag pattern
+        }
+    }
+    sources.append(source_entry)
+
+    # Extract patches specific to vcpkg_from_github
+    patches_github_match = re.search(r'PATCHES\s*([\s\S]*?)(?=\)|\n\S)', content)
+    patches = []
+    if patches_github_match:
+        patch_list_str = patches_github_match.group(1)
+        patches.extend(re.findall(r'(\S+\.patch)', patch_list_str))
+    
+    return sources, patches
+
+def _parse_cmake_options(content: str, package_version: str) -> list:
+    """Parses CMake configure options."""
+    cmake_options_match = re.search(
+        r'vcpkg_cmake_configure\([\s\S]*?OPTIONS\s+((?:[^\n]|\n\s*)*?)(?=\n\s*\S|$)',
+        content,
+        re.DOTALL
+    )
+    
+    raw_opts = []
+    if cmake_options_match:
+        options_str = cmake_options_match.group(1)
+        raw_opts = [s.strip() for s in re.split(r'\s*\n\s*', options_str) if s.strip()]
+
+    clean_opts = []
+    for opt in raw_opts:
+        cleaned_opt = _clean_cmake_option(opt, package_version)
+        if cleaned_opt:
+            clean_opts.append(cleaned_opt)
+
+    # Add essential Flatpak CMake options
+    essential_opts = [
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_INSTALL_PREFIX=/app/vendor",
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
+    ]
+    
+    # Prepend essential options and deduplicate
+    all_opts = essential_opts + clean_opts
+    return sorted(list(dict.fromkeys(all_opts).keys()))
+
+def _parse_dependencies(content: str, package_name: str) -> tuple[list, list]:
+    """Extracts direct and host dependencies."""
+    direct_dependencies = []
+    host_dependencies = []
+
+    # vcpkg_find_package(NAME <pkg> ...)
+    for match in re.finditer(r'vcpkg_find_package\(\s*NAME\s+([^\s\)]+)', content):
+        dep_name = match.group(1)
+        direct_dependencies.append(dep_name)
+
+    # vcpkg_check_features (simple case, assumes features map to dependencies)
+    feature_deps_match = re.search(r'vcpkg_check_features\([\s\S]*?FEATURES\s*([\s\S]*?)(?:OUT_FEATURE_OPTIONS|$)', content)
+    if feature_deps_match:
+        feature_list_str = feature_deps_match.group(1)
+        feature_names = re.findall(r'(\w+)', feature_list_str)
+        for feature in feature_names:
+            if feature.lower() not in ["core", "dbg", "tools", "doc", "test", "examples", "opengl", "debug", "private"]:
+                direct_dependencies.append(feature)
+
+    # vcpkg_copy_tools (indicates a host dependency)
+    copy_tools_match = re.search(r'vcpkg_copy_tools\([\s\S]*?TOOL_NAMES\s*([\s\S]*?)(?=\)|\n\S)', content)
+    if copy_tools_match:
+        tool_names_str = copy_tools_match.group(1)
+        tool_names = re.findall(r'(\w+)', tool_names_str)
+        for tool in tool_names:
+            if "grpc" in tool and "grpc" not in host_dependencies: # Heuristic for specific tools
+                host_dependencies.append("grpc")
+            elif "protoc" in tool and "protobuf" not in host_dependencies:
+                host_dependencies.append("protobuf")
+            else:
+                host_dependencies.append(tool) # Potential host dependency, manual review needed.
+
+    # Filter out self-dependencies and deduplicate
+    direct_dependencies = list(dict.fromkeys([dep for dep in direct_dependencies if dep != package_name]))
+    host_dependencies = list(dict.fromkeys([dep for dep in host_dependencies if dep != package_name]))
+
+    return direct_dependencies, host_dependencies
+
+# --- Main Parsing Logic ---
+
+def parse_vcpkg_portfile(portfile_path: Path) -> tuple[dict, list, list]:
     """
-    Parses a vcpkg portfile.cmake and extracts information for a Flatpak module,
-    along with its direct vcpkg dependencies.
-
-    Returns:
-        tuple[dict, list, list]: (module_data, direct_dependencies, host_dependencies)
+    Main function to parse a single vcpkg portfile and extract all relevant data.
+    Chooses the appropriate source acquisition method.
     """
     content = portfile_path.read_text()
     package_name = portfile_path.parent.name
     
     # Try to get the version from vcpkg.json first
     vcpkg_json_path = portfile_path.parent / "vcpkg.json"
-    version = None
+    package_version = "UNKNOWN_VERSION"
     if vcpkg_json_path.exists():
         try:
             vcpkg_json = yaml.safe_load(vcpkg_json_path.read_text())
-            version = vcpkg_json.get("version") or vcpkg_json.get("version-string")
-            if version and version.startswith("v"): # remove v prefix for flatpak tag
-                version = version[1:]
+            package_version = vcpkg_json.get("version") or vcpkg_json.get("version-string")
+            if package_version and package_version.startswith("v"):
+                package_version = package_version[1:]
         except Exception as e:
-            print(f"Warning: Could not parse {vcpkg_json_path}: {e}")
+            print(f"Warning: Could not parse {vcpkg_json_path} for {package_name} version: {e}")
 
     module_data = {
         "name": package_name,
         "builddir": True,
         "sources": [],
-        "buildsystem": "cmake", # Assuming cmake for most vcpkg C++ ports
+        "buildsystem": "cmake", # Default, but could be "simple", "autotools" if detected
         "config-opts": [],
         "install-commands": []
     }
+    
+    all_patches = []
 
-    # 1. Parse vcpkg_from_github
-    # Adjusted regex to handle more variations and capture more
-    from_github_match = re.search(
-        r'vcpkg_from_github\(\s*'
-        r'(?:OUT_SOURCE_PATH\s+\S+\s*)?'
-        r'REPO\s+([^\s\)]+)\s*'
-        r'REF\s+"?\$?\{?VERSION\}?"?\s*(?:#.*)?\s*', # Matches "REF \"${VERSION}\"" or "REF ${VERSION}" etc.
-        content,
-        re.DOTALL
-    )
+    # Attempt to parse source acquisition methods in order of precedence
+    sources_and_patches = _parse_vcpkg_download_distfile(content, package_name, package_version)
+    if sources_and_patches:
+        module_data["sources"], all_patches = sources_and_patches
+    else:
+        sources_and_patches = _parse_vcpkg_from_github(content, package_name, package_version)
+        if sources_and_patches:
+            module_data["sources"], all_patches = sources_and_patches
+        else:
+            print(f"Warning: No explicit vcpkg_from_github or vcpkg_download_distfile found for {package_name}. "
+                  "Assuming source is handled externally or it's a header-only library/simple build. "
+                  "Manual source setup may be required for this module.")
+            # For this case, we might add a placeholder source or assume source is copied
+            # For simplicity, we'll leave sources empty.
 
-    if from_github_match:
-        repo = from_github_match.group(1)
-        # Use extracted version if found, otherwise placeholder.
-        source_tag = version if version else "UNKNOWN_VERSION"
-        
+    # Add patch files to sources and install-commands
+    for patch_file in sorted(list(set(all_patches))):
         module_data["sources"].append({
-            "type": "git",
-            "url": f"https://github.com/{repo}.git",
-            "tag": source_tag # Use a placeholder or found version
+            "type": "file",
+            "path": f"patches/{patch_file}"
         })
+        module_data["install-commands"].append(f"patch -p1 < {patch_file}")
 
-        # Extract patches
-        # Regex to find PATCHES block, handling comments and different line endings
-        patches_block_match = re.search(r'PATCHES\s*([\s\S]*?)(?=\)|\n\S)', content)
-        if patches_block_match:
-            patch_list_str = patches_block_match.group(1)
-            # Find words ending in .patch, filter out commented lines
-            patches = [
-                p for p in re.findall(r'(\S+\.patch)', patch_list_str)
-                if not re.match(r'^\s*#', p, re.MULTILINE) # Filter lines that start with a comment
-            ]
-            for patch_file in patches:
-                module_data["sources"].append({
-                    "type": "file",
-                    "path": f"patches/{patch_file}" # Assumes patches are in a 'patches' subdir relative to manifest
-                })
-                module_data["install-commands"].append(f"patch -p1 < {patch_file}") # Add patch command
+    # Add common CMake install command if not already added by patches
+    if not module_data["install-commands"] or "cmake --build . --target install" not in module_data["install-commands"]:
+        module_data["install-commands"].append("cmake --build . --target install")
 
 
-    # 2. Parse vcpkg_cmake_configure OPTIONS
-    # Main OPTIONS group, and also look for FEATURE_OPTIONS
-    cmake_options_match = re.search(
-        r'vcpkg_cmake_configure\([\s\S]*?OPTIONS\s+((?:[^\n]|\n\s*)*?)(?=\n\s*\S|$)',
-        content,
-        re.DOTALL
-    )
-    feature_options_var_match = re.search(
-        r'vcpkg_check_features\([\s\S]*?OUT_FEATURE_OPTIONS\s+(\S+)',
-        content
-    )
-    feature_options_var = feature_options_var_match.group(1) if feature_options_var_match else None
-
-    raw_opts = []
-    if cmake_options_match:
-        options_str = cmake_options_match.group(1)
-        # Split by whitespace, handling newlines and comments
-        raw_opts = [s.strip().strip('"').strip("'") for s in re.split(r'\s*\n\s*', options_str) if s.strip()]
-
-    clean_opts = []
-    for opt in raw_opts:
-        if not opt or opt.startswith("#") or opt == "${FEATURE_OPTIONS}" or (feature_options_var and opt == f"${{{feature_options_var}}}"):
-            continue
-
-        # Replace vcpkg-specific paths with Flatpak-native /app/vendor
-        # This is a heuristic and might need manual adjustment.
-        opt = opt.replace('${CURRENT_HOST_INSTALLED_DIR}/tools/protobuf/protoc${VCPKG_HOST_EXECUTABLE_SUFFIX}', '/app/vendor/bin/protoc')
-        opt = opt.replace('${CURRENT_INSTALLED_DIR}', '/app/vendor')
-        opt = opt.replace('${CURRENT_HOST_INSTALLED_DIR}', '/app/vendor')
-        opt = opt.replace('${CURRENT_PACKAGES_DIR}', '/app/vendor') # For things like INSTALL_CMAKEDIR
-
-        # Remove vcpkg-specific build flags that Flatpak builder handles or are irrelevant
-        if (opt.startswith("-DCMAKE_TOOLCHAIN_FILE") or
-            opt.startswith("-DVCPKG_TARGET_TRIPLET") or
-            opt.startswith("-DVCPKG_SET_CHARSET_FLAG") or
-            opt.startswith("-DDLL_OUT_DIR") or
-            opt.startswith("-DARCHIVE_OUT_DIR") or
-            opt.startswith("-DCMAKE_DEBUG_POSTFIX") or
-            opt.startswith("-D_VCPKG_NO_DEFAULT_PATH_W") or
-            opt.startswith("-D_VCPKG_FIND_ROOT_PATH_") or
-            opt.startswith("-DCMAKE_MFC_FLAG") or
-            "VCPKG_CRT_LINKAGE" in opt or
-            "VCPKG_LIBRARY_LINKAGE" in opt
-        ):
-            continue
-
-        # Convert vcpkg's INSTALL_DIRS to just relying on CMAKE_INSTALL_PREFIX
-        if (opt.startswith("-DgRPC_INSTALL_BINDIR") or
-            opt.startswith("-DgRPC_INSTALL_LIBDIR") or
-            opt.startswith("-DgRPC_INSTALL_INCLUDEDIR") or
-            opt.startswith("-DgRPC_INSTALL_CMAKEDIR")):
-            continue
-
-        clean_opts.append(opt)
-
-    # Add essential Flatpak CMake options
-    module_data["config-opts"].append("-DCMAKE_BUILD_TYPE=Release")
-    module_data["config-opts"].append("-DCMAKE_INSTALL_PREFIX=/app/vendor")
-    module_data["config-opts"].append("-DCMAKE_POSITION_INDEPENDENT_CODE=ON") # Good practice for Flatpak
-
-    module_data["config-opts"].extend(clean_opts)
-
-    # Deduplicate options
-    module_data["config-opts"] = sorted(list(dict.fromkeys(module_data["config-opts"]).keys()))
-
-
-    # 3. Extract Dependencies
-    direct_dependencies = []
-    host_dependencies = []
-
-    # vcpkg_find_package(NAME <pkg> ...)
-    for match in re.finditer(r'vcpkg_find_package\(\s*NAME\s+(\S+)', content):
-        dep_name = match.group(1)
-        direct_dependencies.append(dep_name)
-
-    # vcpkg_check_features (simple case, assumes features map to dependencies)
-    # This is a heuristic: it assumes feature names often correspond to package names
-    # e.g., 'zlib' feature -> 'zlib' package
-    feature_deps_match = re.search(r'vcpkg_check_features\([\s\S]*?FEATURES\s*([\s\S]*?)(?:OUT_FEATURE_OPTIONS|$)', content)
-    if feature_deps_match:
-        feature_list_str = feature_deps_match.group(1)
-        feature_names = re.findall(r'(\w+)', feature_list_str)
-        for feature in feature_names:
-            # Common dependencies usually named after feature, e.g., 'zlib' feature uses 'zlib' package
-            # This is a heuristic and might need manual adjustment.
-            if feature.lower() not in ["core", "dbg", "tools", "doc", "test", "examples", "opengl", "debug"]: # Common non-package features
-                direct_dependencies.append(feature)
-
-    # vcpkg_copy_tools (indicates a host dependency)
-    # This is rough, as tool names don't always map directly to package names
-    copy_tools_match = re.search(r'vcpkg_copy_tools\([\s\S]*?TOOL_NAMES\s*([\s\S]*?)(?=\)|\n\S)', content)
-    if copy_tools_match:
-        tool_names_str = copy_tools_match.group(1)
-        tool_names = re.findall(r'(\w+)', tool_names_str)
-        for tool in tool_names:
-            # Heuristic: map tool names like 'grpc_cpp_plugin' to 'grpc' itself, or 'protoc' to 'protobuf'
-            if "grpc" in tool and "grpc" not in host_dependencies:
-                host_dependencies.append("grpc")
-            elif "protoc" in tool and "protobuf" not in host_dependencies:
-                host_dependencies.append("protobuf")
-            else:
-                # Add the tool name as a potential host dependency. Manual review needed.
-                host_dependencies.append(tool)
-
-
-    # Filter out self-dependencies
-    direct_dependencies = [dep for dep in direct_dependencies if dep != package_name]
-    host_dependencies = [dep for dep in host_dependencies if dep != package_name]
-
-    # Deduplicate dependencies
-    direct_dependencies = list(dict.fromkeys(direct_dependencies))
-    host_dependencies = list(dict.fromkeys(host_dependencies))
+    module_data["config-opts"] = _parse_cmake_options(content, package_version)
+    direct_dependencies, host_dependencies = _parse_dependencies(content, package_name)
 
     return module_data, direct_dependencies, host_dependencies
+
+# --- Topological Sort (unchanged from previous version) ---
 
 def topological_sort(graph):
     """Performs a topological sort on a directed graph."""
@@ -217,8 +334,18 @@ def topological_sort(graph):
                 queue.append(v)
 
     if len(sorted_nodes) != len(graph):
-        raise ValueError("Circular dependency detected in the graph!")
+        remaining_nodes = set(graph.keys()) - set(sorted_nodes)
+        if remaining_nodes:
+            cycle_nodes = list(remaining_nodes)
+            error_msg = f"Circular dependency detected involving: {cycle_nodes}. "
+            error_msg += "Check the portfiles for these packages."
+            raise ValueError(error_msg)
+        else:
+            raise ValueError("Topological sort failed for an unknown reason (graph size mismatch).")
     return sorted_nodes
+
+
+# --- Main Execution (largely unchanged, but calls refactored parsers) ---
 
 def main():
     parser = argparse.ArgumentParser(
@@ -252,7 +379,7 @@ def main():
         print(f"Error: VCPKG_ROOT does not contain a 'ports' directory: {ports_dir}")
         return 1
 
-    package_graph = defaultdict(set) # {package: {dependencies}}
+    package_deps_map = defaultdict(set) # {dependent: {dependencies}}
     all_modules_data = {}
     processed_packages = set()
     queue = deque(args.start_packages)
@@ -268,97 +395,61 @@ def main():
             continue
 
         print(f"Processing: {current_pkg}")
-        module_data, direct_deps, host_deps = parse_vcpkg_portfile(portfile_path, vcpkg_root)
+        # Call the refactored parse_vcpkg_portfile
+        module_data, direct_deps, host_deps = parse_vcpkg_portfile(portfile_path)
         all_modules_data[current_pkg] = module_data
         processed_packages.add(current_pkg)
 
-        for dep in direct_deps + host_deps: # Treat all discovered deps as needed for ordering
+        for dep in direct_deps + host_deps:
             if dep not in processed_packages and dep not in queue:
                 queue.append(dep)
-            package_graph[current_pkg].add(dep) # This is actually saying current_pkg depends on dep
-                                                # For topological sort, we want dep -> current_pkg
+            package_deps_map[current_pkg].add(dep)
+
 
     # Invert the graph for topological sort (dependencies point to dependents)
-    # A -> B means A is a dependency of B, so A must come before B.
-    # We want a graph where edges go from dependency to dependent.
-    dependency_graph = defaultdict(set)
-    all_involved_packages = set(all_modules_data.keys())
-    for pkg, deps in package_graph.items():
-        all_involved_packages.add(pkg) # Ensure all packages are in the graph nodes
-        for dep in deps:
-            if dep in all_modules_data: # Only add if we actually parsed the dependency
-                dependency_graph[dep].add(pkg)
-            else:
-                # If a dependency was listed but we didn't process its portfile
-                # (e.g., it was skipped due to missing portfile, or it's a very common system lib)
-                # Ensure it's in the graph to avoid errors during sort.
-                dependency_graph[dep] # Add node if not exists (no outgoing edges)
-
-
-    # Add packages that have no outgoing edges (no dependencies listed for them within the graph)
-    # but are part of the set of all packages to be built.
-    for pkg in all_involved_packages:
-        if pkg not in dependency_graph:
-            dependency_graph[pkg] = set()
-
-    # Perform topological sort
-    try:
-        # We need the nodes in topological order. The graph `dependency_graph` has edges
-        # A -> B if A must be built before B. So we sort the keys of this graph.
-        # However, `topological_sort` expects edges from parent to child (what it provides).
-        # We need to compute in-degrees on our `dependency_graph` to get correct order.
-
-        # Create a graph where A -> B means B depends on A.
-        # The `package_graph` we built is actually more like this already: {dependent: {dependencies}}
-        # Let's rebuild the graph structure to be `dep -> dependent` for sorting.
-
-        graph_for_sort = defaultdict(set)
-        for pkg, deps_of_pkg in package_graph.items():
-            # pkg depends on deps_of_pkg. So deps_of_pkg must come before pkg.
-            # Add reverse edges: dep -> pkg
-            for dep in deps_of_pkg:
-                # Ensure all nodes are present in graph_for_sort, even if they have no dependencies
-                if dep not in all_involved_packages and dep not in all_modules_data:
-                     # This might be a system lib not handled by vcpkg. Add a dummy node.
-                     graph_for_sort[dep] = set()
+    graph_for_sort = defaultdict(set)
+    
+    # Build the graph_for_sort where edges go from dependency to dependent
+    for pkg, deps_of_pkg in package_deps_map.items():
+        for dep in deps_of_pkg:
+            if dep in all_modules_data: # Only add edges if the dependency is also a module we intend to build
                 graph_for_sort[dep].add(pkg)
-            # Ensure the current package is a node in the graph, even if it has no explicit dependencies
-            if pkg not in graph_for_sort:
-                graph_for_sort[pkg] = set()
+            else: # Ensure any discovered dependencies are nodes, even if we don't build them (e.g., system libs)
+                if dep not in graph_for_sort:
+                    graph_for_sort[dep] = set()
+        # Ensure the current package (pkg) is also a node in the graph, even if it has no explicit dependencies
+        if pkg not in graph_for_sort:
+            graph_for_sort[pkg] = set()
 
-        # Filter out nodes from graph_for_sort that aren't in all_modules_data,
-        # as we only want to generate modules for the ones we parsed.
-        final_graph_nodes = sorted([node for node in graph_for_sort if node in all_modules_data])
-        # Rebuild graph to only contain relevant nodes and edges between them
-        cleaned_graph_for_sort = defaultdict(set)
-        for u in final_graph_nodes:
+    # Filter `graph_for_sort` to only include nodes that are in `all_modules_data`
+    # (i.e., only packages for which we have actually generated a Flatpak module).
+    filtered_graph_for_sort = defaultdict(set)
+    for u in graph_for_sort:
+        if u in all_modules_data:
             for v in graph_for_sort[u]:
-                if v in final_graph_nodes:
-                    cleaned_graph_for_sort[u].add(v)
-            if u not in cleaned_graph_for_sort: # Ensure nodes with no outgoing edges are present
-                cleaned_graph_for_sort[u] = set()
+                if v in all_modules_data:
+                    filtered_graph_for_sort[u].add(v)
+            if u not in filtered_graph_for_sort:
+                filtered_graph_for_sort[u] = set()
 
-        # Perform the sort
-        sorted_package_names = topological_sort(cleaned_graph_for_sort)
 
-        # Reverse the order if it's dependency -> dependent
-        # The topological sort typically orders nodes such that if there is an edge
-        # from A to B, then A appears before B in the ordering.
-        # So, if graph_for_sort is `dependency -> dependent`, the result is correct.
+    try:
+        sorted_package_names = topological_sort(filtered_graph_for_sort)
         final_modules_list = [all_modules_data[name] for name in sorted_package_names]
 
     except ValueError as e:
         print(f"Error during topological sort: {e}")
-        print("Dependency graph (dependency -> dependent):")
-        for pkg, deps in graph_for_sort.items():
-            print(f"  {pkg} -> {deps}")
+        print("\nReconstructed Dependency Graph (Dependency -> Dependent):")
+        for pkg, deps in sorted(filtered_graph_for_sort.items()):
+            print(f"  {pkg}: {sorted(list(deps))}")
+        print("\nNote: Dependencies not listed might be system dependencies or unparsed ports.")
         return 1
 
     # Create the full Flatpak manifest
     flatpak_manifest = {
         "app-id": args.app_id,
         "runtime": args.runtime,
-        "runtime-version": args.runtime.split('/')[-1], # Extract version from runtime string
+        "runtime-version": args.runtime.split('/')[-1],
         "sdk": args.sdk,
         "command": args.app_command,
         "modules": final_modules_list
@@ -370,12 +461,13 @@ def main():
         yaml.dump(flatpak_manifest, f, sort_keys=False, default_flow_style=False, indent=2)
     print(f"\nFlatpak manifest generated and saved to {output_path}")
     print("\nIMPORTANT: Review the generated manifest carefully!")
-    print("  - Manually check package versions. '${FLATPAK_VERSION}' is a placeholder.")
-    print("  - Add `x-checker-data` for automatic updates.")
-    print("  - Adjust CMake flags, especially paths, and feature-related options.")
-    print("  - Ensure patches are correctly copied to your Flatpak project's 'patches/' directory.")
-    print("  - You may need to add `--env` variables for `PATH` or `LD_LIBRARY_PATH` within modules.")
-    print("  - System dependencies (like zlib, openssl) may exist in runtime; check if explicit module is needed.")
+    print("  - Manually verify all package versions. 'UNKNOWN_VERSION' or auto-guessed versions may be incorrect.")
+    print("  - Add `x-checker-data` for automatic updates where missing or incorrect, especially for archives.")
+    print("  - Adjust CMake flags, especially paths, and feature-related options (e.g., `-DgRPC_BUILD_CODEGEN=ON`).")
+    print("  - Ensure patches are correctly copied to your Flatpak project's 'patches/' directory (if any).")
+    print("  - You may need to add `--env` variables for `PATH` or `LD_LIBRARY_PATH` within modules for some tools (e.g., protoc).")
+    print("  - Common system dependencies (like zlib, openssl, curl) may exist in the runtime; consider removing explicit modules if they are not patched.")
+    print("  - Transitive dependency flags (e.g., `-DProtobuf_DIR=/app/vendor/lib/cmake/protobuf`) might still need manual adjustment for absolute `/app/vendor/` paths, or using `CMAKE_PREFIX_PATH` in your final application module.")
 
     return 0
 
