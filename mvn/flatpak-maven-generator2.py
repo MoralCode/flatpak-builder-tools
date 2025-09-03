@@ -7,7 +7,7 @@ import re
 
 # --- Configuration ---
 MAVEN_EXECUTABLE = "mvn"  # Or the full path to your mvn if not in PATH
-OUTPUT_URLS_FILE = "maven_download_urls.json"
+FLATPAK_SOURCES_JSON_FILE = "flatpak_maven_sources_no_hash.json"
 DEFAULT_MAVEN_REPO_URL = "https://repo.maven.apache.org/maven2/"
 
 # --- Helper Functions ---
@@ -152,13 +152,29 @@ def construct_maven_url(base_repo_url, group_id, artifact_id, version, extension
     filename += f".{extension}"
     return f"{base_repo_url.rstrip('/')}/{group_path}/{artifact_id}/{version}/{filename}"
 
+# --- New function to output as Flatpak sources JSON ---
 
-# --- Main Script Logic ---
-
-def get_maven_download_urls(project_path):
+def output_flatpak_sources_json(flatpak_urls_list, output_file_path):
     """
-    Generates a JSON file containing raw Maven download URLs for a given project's dependencies.
-    No SHA256 hashes are calculated or included.
+    Writes a list of Flatpak source dictionaries to a JSON file.
+    The output is a direct JSON array suitable for a Flatpak module's 'sources' field.
+    """
+    try:
+        with open(output_file_path, "w") as f:
+            json.dump(flatpak_urls_list, f, indent=2)
+        print(f"\nGenerated Flatpak sources JSON (without hashes) at: {output_file_path}")
+        print(f"Total {len(flatpak_urls_list)} unique URLs identified.")
+        print("\nNOTE: This file does NOT contain SHA256 hashes. You will need to obtain them")
+        print("      either manually or by using `flatpak-builder --collect-modules` during build.")
+    except Exception as e:
+        print(f"ERROR: Could not write Flatpak sources JSON to {output_file_path}: {e}")
+
+# --- Main Script Logic (modified) ---
+
+def get_maven_flatpak_sources(project_path):
+    """
+    Generates a Flatpak-compatible JSON file containing source URLs for a given
+    Maven project's dependencies. SHA256 hashes are NOT included.
     """
     project_path = Path(project_path).resolve()
     pom_file = project_path / "pom.xml"
@@ -167,7 +183,7 @@ def get_maven_download_urls(project_path):
         print(f"ERROR: pom.xml not found at {pom_file}. Please provide the root path of a Maven project.")
         return
 
-    print(f"Analyzing Maven project: {project_path} for download URLs (no hashing)...")
+    print(f"Analyzing Maven project: {project_path} for Flatpak sources (no hashing)...")
 
     try:
         # 1. Get remote repositories from pom.xml
@@ -176,7 +192,6 @@ def get_maven_download_urls(project_path):
 
         # 2. Get project dependencies GAVs
         print("Resolving project dependencies GAVs...")
-        # Use -DincludeTypes to specify which types of artifacts we care about (jar, pom)
         dependency_list_output = run_maven_command(
             project_path,
             ["dependency:list", "-DoutputType=text", "-DincludeTypes=jar,pom,maven-plugin,bundle,war,ear"]
@@ -185,7 +200,6 @@ def get_maven_download_urls(project_path):
 
         # 3. Get plugin dependencies GAVs
         print("Resolving plugin dependencies GAVs...")
-        # Plugins can also have their own dependencies and pom files
         plugin_list_output = run_maven_command(
             project_path,
             ["dependency:resolve-plugins", "-DoutputType=text", "-DincludeTypes=jar,pom,maven-plugin"]
@@ -200,11 +214,10 @@ def get_maven_download_urls(project_path):
 
         print(f"\nFound {len(all_gavs)} unique Maven GAVs to process.")
 
-        flatpak_urls = []
-        # Keep track of URLs we've already added to avoid duplicates
-        added_urls = set()
+        flatpak_sources_list = []
+        added_urls = set() # To prevent duplicate URLs in the output
 
-        for group_id, artifact_id, version, classifier, packaging in sorted(list(all_gavs)): # Sort for consistent output
+        for group_id, artifact_id, version, classifier, packaging in sorted(list(all_gavs)):
             # Construct URLs for main artifact, POM, sources, and javadoc
             # Main artifact
             main_url = construct_maven_url(
@@ -234,54 +247,37 @@ def get_maven_download_urls(project_path):
             for base_url in potential_urls_for_gav:
                 dest_filename = base_url.split('/')[-1]
 
-                # Try to determine the most appropriate repo for this artifact
-                # This part is heuristic; Maven's full resolution is complex.
-                # We prioritize configured repos over default if it looks like the same type of URL.
-                final_download_url = None
+                # First, check configured repositories
+                found_in_config_repo = False
                 for repo_url in maven_repositories:
                     # Replace the default URL's base with the current repo's base
                     candidate_url = base_url.replace(DEFAULT_MAVEN_REPO_URL.rstrip('/'), repo_url)
-                    
-                    # Heuristic check: does the candidate URL seem plausible for this repo?
-                    # E.g., don't try to get a Spring Boot artifact from a custom internal repo that only has org.mycompany.
-                    # This check is hard to make without actual network requests.
-                    # For simplicity, we'll assume any configured repo might host it.
-                    final_download_url = candidate_url
-                    
-                    # A more robust check might involve actually probing the URL or Maven metadata,
-                    # but the request is to *not* download, so we just list possibilities.
-                    # For now, we'll list all valid combinations.
-                    
-                    if final_download_url not in added_urls:
-                        flatpak_urls.append({
+                    if candidate_url not in added_urls:
+                        flatpak_sources_list.append({
                             "type": "archive",
-                            "url": final_download_url,
-                            "dest-filename": dest_filename # flatpak-builder can use this for its local cache
                             # SHA256 is intentionally omitted here
+                            "url": candidate_url,
+                            "dest-filename": dest_filename
                         })
-                        added_urls.add(final_download_url)
-                        print(f"  Identified URL: {final_download_url}")
+                        added_urls.add(candidate_url)
+                        print(f"  Identified URL from config repo: {candidate_url}")
+                        found_in_config_repo = True
                 
-                # Also include the default Maven Central URL as a fallback if not explicitly found in other repos
+                # Also include the default Maven Central URL if it hasn't been added already
+                # (e.g., if it's not explicitly in maven_repositories, or was a different artifact path)
                 if base_url not in added_urls:
-                     flatpak_urls.append({
+                     flatpak_sources_list.append({
                         "type": "archive",
                         "url": base_url,
                         "dest-filename": dest_filename
                      })
                      added_urls.add(base_url)
-                     print(f"  Identified URL (fallback): {base_url}")
+                     print(f"  Identified URL (fallback to Maven Central): {base_url}")
 
 
-        # 4. Write the URLs to a JSON file
-        output_file_path = project_path / OUTPUT_URLS_FILE
-        with open(output_file_path, "w") as f:
-            json.dump(flatpak_urls, f, indent=2)
-
-        print(f"\nSuccessfully generated Maven download URLs JSON at: {output_file_path}")
-        print(f"Total {len(flatpak_urls)} unique URLs identified.")
-        print("\nNOTE: This file does NOT contain SHA256 hashes. You will need to obtain them")
-        print("      either manually or by using `flatpak-builder --collect-modules`.")
+        # Output the collected URLs as a Flatpak sources JSON file
+        output_file_path = project_path / FLATPAK_SOURCES_JSON_FILE
+        output_flatpak_sources_json(flatpak_sources_list, output_file_path)
 
     except Exception as e:
         print(f"\nAn error occurred: {e}")
@@ -292,8 +288,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Generate a JSON file with raw Maven download URLs for a project's dependencies."
-                    "SHA256 hashes are NOT included."
+        description="Generate a Flatpak-compatible JSON file with source URLs for a project's Maven dependencies."
+                    "SHA256 hashes are NOT included, and will need to be added manually or by Flatpak Builder."
     )
     parser.add_argument(
         "project_path",
@@ -301,4 +297,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    get_maven_download_urls(args.project_path)
+    get_maven_flatpak_sources(args.project_path)
