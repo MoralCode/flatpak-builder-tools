@@ -100,6 +100,10 @@ def parse_dependency_list_output(output):
         line = line.strip()
         if not line or line == "":
             continue
+        if "---" in line:
+                continue
+        if "Finished at:" in line:
+            continue
         try:
             if "Resolved:" in line:
                 line = line.split("Resolved: ")[1]
