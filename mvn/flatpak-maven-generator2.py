@@ -59,16 +59,16 @@ def parse_pom_for_repositories(pom_file):
         namespace = {'mvn': 'http://maven.apache.org/POM/4.0.0'} # Maven POM namespace
 
         # Project repositories
-        for repo in root.findall('mvn:repositories/mvn:repository', namespace):
-            url = repo.find('mvn:url', namespace)
-            if url is not None and url.text:
-                repositories.append(url.text.rstrip('/'))
+        # for repo in root.findall('mvn:repositories/mvn:repository', namespace):
+        #     url = repo.find('mvn:url', namespace)
+        #     if url is not None and url.text:
+        #         repositories.append(url.text.rstrip('/'))
 
         # Plugin repositories
-        for repo in root.findall('mvn:pluginRepositories/mvn:pluginRepository', namespace):
-            url = repo.find('mvn:url', namespace)
-            if url is not None and url.text:
-                repositories.append(url.text.rstrip('/'))
+        # for repo in root.findall('mvn:pluginRepositories/mvn:pluginRepository', namespace):
+        #     url = repo.find('mvn:url', namespace)
+        #     if url is not None and url.text:
+        #         repositories.append(url.text.rstrip('/'))
 
     except ET.ParseError as e:
         print(f"WARNING: Could not parse POM file {pom_file}: {e}")
