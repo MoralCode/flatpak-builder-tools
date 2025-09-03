@@ -103,6 +103,8 @@ def parse_dependency_list_output(output):
         try:
             if "Resolved:" in line:
                 line = line.split("Resolved: ")[1]
+            elif "    " in line:
+                line = line.split("    ")[1]
         except Exception as e:
             pass
 
