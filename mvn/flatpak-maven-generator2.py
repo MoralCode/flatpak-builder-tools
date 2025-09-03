@@ -98,8 +98,13 @@ def parse_dependency_list_output(output):
     gavs = set()
     for line in output.splitlines():
         line = line.strip()
-        if not line or line.startswith(('[INFO]', '[WARNING]', '[ERROR]', '---')):
+        if not line or line == "":
             continue
+        try:
+            if "Resolved:" in line:
+                line = line.split("Resolved: ")[1]
+        except Exception as e:
+            pass
 
         # Clean line to only contain GAV-like structure, remove scope, etc.
         # Example: org.springframework.boot:spring-boot:jar:2.7.0:compile
